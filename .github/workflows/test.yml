@@ -123,6 +123,36 @@ jobs:
           printf '%s' '${{ steps.evnx.outputs.result }}' \
             | python3 -c 'import json,sys; json.load(sys.stdin); print("valid JSON")'
 
+  # ⛔ validate's `findings` was 0 on every run, failing or not: the action read
+  # `findings` / `errors`, and validate's JSON lists `issues`. The fixture has
+  # exactly two errors — a missing variable and a weak secret — on every release
+  # from 0.10.0 to 0.10.3, so the count is not version-dependent.
+  validate-findings:
+    name: validate reports its error count as findings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the action
+        id: evnx
+        uses: ./
+        with:
+          command: validate
+          format: json
+          exit_zero: "true"
+          env_file: test/fixtures-invalid/.env
+          example_file: test/fixtures-invalid/.env.example
+
+      - name: Assert findings is the error count
+        shell: bash
+        run: |
+          got='${{ steps.evnx.outputs.findings }}'
+          echo "findings: $got"
+          if [ "$got" != "2" ]; then
+            echo "::error::expected 2 findings (missing_variable, weak_secret), got $got"
+            exit 1
+          fi
+
   # ⛔ D5 — a pinned version was ignored entirely when evnx was already on PATH,
   # because the whole install was behind `if ! command -v evnx`. A pin that
   # silently does not pin is worse than one that errors.

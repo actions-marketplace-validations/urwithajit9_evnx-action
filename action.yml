@@ -311,8 +311,12 @@ runs:
 
         # Findings, for the commands whose JSON we can parse.
         # ⓘ diff set FINDINGS already, above, where the drift is derived.
+        # ⛔ validate's JSON has never had `findings` or `errors` — it lists
+        # `issues` (errors and warnings) and counts them in `summary`. Reading
+        # the first two made `findings` 0 for every validate run, failing or
+        # not. It is the error count, as the output's description says.
         if [ "${FINDINGS:-}" = "" ]; then
-          FINDINGS=$(printf '%s' "$OUTPUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d.get("findings", d.get("errors", []))))' 2>/dev/null || echo 0)
+          FINDINGS=$(printf '%s' "$OUTPUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["findings"]) if "findings" in d else d["summary"]["errors"] if "issues" in d else len(d.get("errors", [])))' 2>/dev/null || echo 0)
         fi
 
         {
