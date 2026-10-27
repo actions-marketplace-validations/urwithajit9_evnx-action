@@ -25,9 +25,12 @@ inputs:
       Output format.
       scan supports:  pretty | json | sarif | github
       validate supports: pretty | json | github-actions
-      diff supports:  pretty | json
+      diff supports:  pretty | json | patch
+
+      Leave empty to let each command use its own default — one value cannot
+      suit three commands that accept three different sets.
     required: false
-    default: "github"
+    default: ""
 
   strict:
     description: >
@@ -69,8 +72,12 @@ inputs:
 
   version:
     description: >
-      evnx version to install.
+      evnx CLI version to install, e.g. "v0.9.0" or "0.9.0".
       Defaults to the latest release.
+
+      This is how you pin the CLI. The action's own version is the `uses:` ref
+      (@v1), and the two are deliberately separate — pinning one does not pin
+      the other.
     required: false
     default: "latest"
 
@@ -93,18 +100,98 @@ runs:
     - name: Install evnx
       shell: bash
       run: |
-        set -e
-        if ! command -v evnx &>/dev/null; then
-          echo "::group::Installing evnx"
-          if [ "${{ inputs.version }}" = "latest" ]; then
-            curl -fsSL https://dotenv.space/install.sh | bash
-          else
-            curl -fsSL "https://github.com/urwithajit9/evnx/releases/download/${{ inputs.version }}/evnx-linux-x86_64" \
-              -o /usr/local/bin/evnx && chmod +x /usr/local/bin/evnx
-          fi
-          echo "::endgroup::"
+        set -euo pipefail
+
+        VERSION="${{ inputs.version }}"
+
+        # ⚠️ A pin must override an evnx that is already on PATH. The previous
+        # version put the whole install behind `if ! command -v evnx`, so on a
+        # self-hosted runner — or the second use of this action in one job —
+        # `version:` was silently ignored. A pin that does not pin is worse than
+        # one that errors.
+        if [ "$VERSION" = "latest" ] && command -v evnx >/dev/null 2>&1; then
+          echo "evnx already present: $(evnx --version)"
+          exit 0
         fi
-        echo "evnx $(evnx --version) ready"
+
+        echo "::group::Installing evnx ($VERSION)"
+
+        if [ "$VERSION" = "latest" ]; then
+          # ⚠️ The HTML redirect, not api.github.com.
+          #
+          # The API allows 60 unauthenticated requests per hour **per IP**, and
+          # GitHub Actions runners share a small pool of egress addresses with
+          # every other Actions user on the platform. So this call returns 403
+          # at times that have nothing to do with this repository — and under
+          # `curl -f` plus `set -e` that kills the install outright, leaving the
+          # job with no evnx on PATH and an error that points at the wrong
+          # thing. Seven matrix rows resolve `latest`, so one run is seven
+          # draws against a budget it does not control.
+          #
+          # `releases/latest` redirects to `releases/tag/<tag>`, so the tag is
+          # the last path segment. Verified to return the same value as the
+          # API's `tag_name`.
+          VERSION=$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+                    https://github.com/urwithajit9/evnx/releases/latest)
+          VERSION="${VERSION##*/}"
+          # ⚠️ Without this, a request that does not redirect leaves VERSION as
+          # the literal "latest", which becomes the tag `vlatest` two lines
+          # down and 404s on the asset — reporting a missing release for what
+          # is actually a resolution failure.
+          if [ -z "$VERSION" ] || [ "$VERSION" = "latest" ]; then
+            echo "::error::could not resolve the latest evnx release"; exit 1
+          fi
+          echo "latest resolves to $VERSION"
+        fi
+
+        # Release tags carry the v. Users write it both ways, so accept both
+        # rather than 404 on a plausible spelling.
+        case "$VERSION" in v*) ;; *) VERSION="v$VERSION" ;; esac
+
+        case "$(uname -m)" in
+          x86_64)          TARGET="x86_64-unknown-linux-musl" ;;
+          aarch64|arm64)   TARGET="aarch64-unknown-linux-musl" ;;
+          *) echo "::error::unsupported runner architecture $(uname -m)"; exit 1 ;;
+        esac
+
+        # ⚠️ Releases ship `evnx-<target-triple>.tar.gz`. The previous version
+        # fetched `evnx-linux-x86_64`, which has never been a release asset, so
+        # every pinned install 404'd.
+        ASSET="evnx-${TARGET}.tar.gz"
+        BASE="https://github.com/urwithajit9/evnx/releases/download/${VERSION}"
+
+        TMP="$(mktemp -d)"
+        trap 'rm -rf "$TMP"' EXIT
+        curl -fsSL "${BASE}/${ASSET}"        -o "$TMP/${ASSET}"
+        curl -fsSL "${BASE}/${ASSET}.sha256" -o "$TMP/${ASSET}.sha256"
+
+        # ⛔ Verify BEFORE the binary runs. Every release publishes a .sha256 and
+        # this action ignored it. Installing an unverified binary into
+        # /usr/local/bin is the wrong posture for a tool that sells secret safety.
+        ( cd "$TMP" && sha256sum -c "${ASSET}.sha256" )
+
+        tar -xzf "$TMP/${ASSET}" -C "$TMP"
+
+        # ⚠️ The tarball contains `evnx-<target-triple>`, NOT `evnx`. Assuming
+        # the plain name fails with a bare "install: No such file or directory"
+        # that says nothing about why. Checked against v0.8.0 and v0.9.0; the
+        # fallbacks cover a layout change without needing another release to
+        # find out.
+        BIN="$TMP/evnx-${TARGET}"
+        [ -f "$BIN" ] || BIN="$TMP/evnx"
+        [ -f "$BIN" ] || BIN="$(find "$TMP" -maxdepth 2 -type f -name 'evnx*' \
+                                 ! -name '*.tar.gz' ! -name '*.sha256' | head -1)"
+        if [ ! -f "${BIN:-}" ]; then
+          echo "::error::no evnx binary inside ${ASSET} — contents: $(tar -tzf "$TMP/${ASSET}" | tr '\n' ' ')"
+          exit 1
+        fi
+
+        # install(1) rather than `-o /usr/local/bin/evnx`: that directory is
+        # root-owned on GitHub runners, so a plain redirect fails.
+        sudo install -m 755 "$BIN" /usr/local/bin/evnx
+
+        echo "::endgroup::"
+        echo "$(evnx --version) ready"
 
     - name: Run evnx ${{ inputs.command }}
       id: run-evnx
@@ -124,20 +211,33 @@ runs:
 
         build_flags() {
           FLAGS=""
+          # ⚠️ Only when the caller set it. A single default cannot suit three
+          # commands that accept three different sets of values.
+          fmt() { [ -n "$FORMAT" ] && FLAGS="$FLAGS --format $FORMAT"; }
+
           case "$CMD" in
             scan)
-              [ -n "$PATH_ARG" ] && [ "$PATH_ARG" != "." ] && FLAGS="$FLAGS --path $PATH_ARG"
-              FLAGS="$FLAGS --format $FORMAT"
+              fmt
               [ "$EXIT_ZERO" = "true" ] && FLAGS="$FLAGS --exit-zero"
+              # ⚠️ `scan` takes a POSITIONAL path. `--path` does not exist and
+              # was rejected outright.
+              [ -n "$PATH_ARG" ] && [ "$PATH_ARG" != "." ] && FLAGS="$FLAGS $PATH_ARG"
               ;;
             validate)
-              [ "$ENV_FILE" != ".env" ] && FLAGS="$FLAGS --file $ENV_FILE"
-              FLAGS="$FLAGS --format $FORMAT"
+              # ⚠️ The flag is `--env`, not `--file`.
+              [ "$ENV_FILE" != ".env" ] && FLAGS="$FLAGS --env $ENV_FILE"
+              [ "$EXAMPLE_FILE" != ".env.example" ] && FLAGS="$FLAGS --example $EXAMPLE_FILE"
+              fmt
               [ "$STRICT" = "true" ] && FLAGS="$FLAGS --strict"
               [ "$EXIT_ZERO" = "true" ] && FLAGS="$FLAGS --exit-zero"
               ;;
             diff)
-              FLAGS="$FLAGS --format $FORMAT"
+              # ⓘ These inputs were declared and then never used by this branch.
+              [ "$ENV_FILE" != ".env" ] && FLAGS="$FLAGS --env $ENV_FILE"
+              [ "$EXAMPLE_FILE" != ".env.example" ] && FLAGS="$FLAGS --example $EXAMPLE_FILE"
+              # ⚠️ Forced to json: the exit code is unusable (see below), so the
+              # result has to be read rather than trusted.
+              FLAGS="$FLAGS --format json"
               ;;
             doctor)
               [ "$PATH_ARG" != "." ] && FLAGS="$FLAGS --path $PATH_ARG"
@@ -147,6 +247,7 @@ runs:
               [ -n "$CONVERT_OUTPUT" ] && FLAGS="$FLAGS --output $CONVERT_OUTPUT"
               ;;
             sync)
+              [ "$ENV_FILE" != ".env" ] && FLAGS="$FLAGS --env $ENV_FILE"
               ;;
           esac
           echo "$FLAGS"
@@ -155,22 +256,69 @@ runs:
         FLAGS=$(build_flags)
         echo "::group::evnx $CMD $FLAGS"
 
-        # Capture output, preserve exit code
+        # ⚠️ stdout and stderr are captured SEPARATELY.
+        #
+        # The previous version did `OUTPUT=$(evnx … 2>&1)`, which folded the
+        # "Docs: https://…" hint evnx writes to stderr into the JSON on stdout.
+        # Every parse then failed, so `findings` was silently always 0 and no
+        # consumer of the `result` output could read it as JSON.
+        ERRFILE="$(mktemp)"
         set +e
-        OUTPUT=$(evnx "$CMD" $FLAGS 2>&1)
+        OUTPUT=$(evnx "$CMD" $FLAGS 2>"$ERRFILE")
         CODE=$?
         set -e
+        STDERR=$(cat "$ERRFILE"); rm -f "$ERRFILE"
 
-        echo "$OUTPUT"
-        echo "::endgroup::"
+        # ⛔ SECURITY — `evnx diff --format json` emits RAW SECRET VALUES in
+        # `env_value`, with or without --show-values. This action forces json
+        # for diff (the exit code is unusable otherwise), so echoing or
+        # exporting that output would print production secrets into the workflow
+        # log and into `steps.<id>.outputs.result`.
+        #
+        # ⚠️ v1.1.0 did exactly that. v1.0.1 did not, because it passed an
+        # unrecognised format that diff silently downgraded to pretty, which
+        # redacts. The fix for the exit code made the leak.
+        #
+        # Key NAMES are not secret — the server stores them in the clear by
+        # design — so the summary below reports names and counts, never values.
+        # ⛔ `evnx diff` exits 1 whenever ANY value differs — and a .env.example
+        # holds empty placeholders, so a perfectly healthy project always does.
+        # Drift is `missing` and `extra`; `different` is what a template looks like.
+        if [ "$CMD" = "diff" ]; then
+          # ⚠️ One line on purpose: multi-line python inside a YAML block
+          # scalar must stay indented or it escapes the scalar, which is a
+          # parse error in a file nothing here would otherwise lint.
+          DRIFT=$(printf '%s' "$OUTPUT" | python3 -c 'import json,sys; s=json.load(sys.stdin)["summary"]; print(s.get("missing",0)+s.get("extra",0))' 2>/dev/null || echo "parse-error")
 
-        # Surface findings count from JSON when format=json
-        FINDINGS=0
-        if echo "$OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('findings', d.get('errors', []))))" 2>/dev/null; then
-          FINDINGS=$(echo "$OUTPUT" | python3 -c "import sys,json; d=json.load(sys.stdin); print(len(d.get('findings', d.get('errors', []))))" 2>/dev/null || echo 0)
+          if [ "$DRIFT" = "parse-error" ]; then
+            echo "::error::could not read evnx diff output as JSON"
+            CODE=2
+          elif [ "$DRIFT" -eq 0 ]; then
+            CODE=0
+          else
+            echo "::error::$DRIFT key(s) missing from or extra in $ENV_FILE"
+            CODE=1
+          fi
+          FINDINGS="$DRIFT"
+
+          # ⛔ Replace the raw JSON before anything prints or exports it.
+          OUTPUT=$(printf '%s' "$OUTPUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); m=d.get("missing",[]); e=d.get("extra",[]); n=lambda x: x.get("key",x) if isinstance(x,dict) else x; print("missing from .env: " + (", ".join(str(n(k)) for k in m) or "none")); print("not in the example: " + (", ".join(str(n(k)) for k in e) or "none")); print("values differing: %d (names only — evnx never prints values here)" % len(d.get("different",[])))' 2>/dev/null || echo "diff completed")
         fi
 
-        # Set outputs
+        [ -n "$OUTPUT" ] && echo "$OUTPUT"
+        [ -n "$STDERR" ] && echo "$STDERR" >&2
+        echo "::endgroup::"
+
+        # Findings, for the commands whose JSON we can parse.
+        # ⓘ diff set FINDINGS already, above, where the drift is derived.
+        # ⛔ validate's JSON has never had `findings` or `errors` — it lists
+        # `issues` (errors and warnings) and counts them in `summary`. Reading
+        # the first two made `findings` 0 for every validate run, failing or
+        # not. It is the error count, as the output's description says.
+        if [ "${FINDINGS:-}" = "" ]; then
+          FINDINGS=$(printf '%s' "$OUTPUT" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d["findings"]) if "findings" in d else d["summary"]["errors"] if "issues" in d else len(d.get("errors", [])))' 2>/dev/null || echo 0)
+        fi
+
         {
           echo "exit_code=$CODE"
           echo "findings=$FINDINGS"
@@ -179,7 +327,6 @@ runs:
           echo "EVNX_EOF"
         } >> "$GITHUB_OUTPUT"
 
-        # Respect exit_zero override
         if [ "$EXIT_ZERO" = "true" ]; then
           exit 0
         fi
